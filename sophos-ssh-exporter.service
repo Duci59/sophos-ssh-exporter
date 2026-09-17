@@ -1,0 +1,24 @@
+[Unit]
+Description=Sophos Firewall SSH Prometheus Exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sophos-exporter
+Group=sophos-exporter
+WorkingDirectory=/opt/sophos-ssh-exporter
+ExecStart=/opt/sophos-ssh-exporter/venv/bin/python /opt/sophos-ssh-exporter/app.py --config /opt/sophos-ssh-exporter/config.yml --port 9200
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening co ban
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

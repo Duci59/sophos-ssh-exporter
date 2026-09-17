@@ -1,0 +1,60 @@
+# ==========================================================================
+# config.yml - CHI CAN thong tin xac thuc cho tung thiet bi.
+# Luong dang nhap (nhap password -> chon "4" vao Device Console) va bo
+# metric mac dinh (fgSysSesCount, fgSysSesRate1, fgSysVersionAv,
+# fgSysVersionIps kieu tuong duong) da duoc hard-code san trong app.py.
+# ==========================================================================
+
+targets:
+  - name: fw1
+    host: 192.168.1.1
+    port: 22
+    username: admin
+    password: "CHANGE_ME"
+    poll_interval: 30        # so giay giua 2 lan poll
+
+  - name: fw2
+    host: 192.168.2.1
+    port: 22
+    username: admin
+    password: "CHANGE_ME"
+    poll_interval: 30
+
+  # them bao nhieu thiet bi tuy y, chi can host/username/password.
+  # - name: fw3
+  #   host: 192.168.3.1
+  #   username: admin
+  #   password: "CHANGE_ME"
+
+# --------------------------------------------------------------------------
+# (Tuy chon - KHONG bat buoc) Neu muon tuy chinh/them metric khac ngoai 4
+# metric mac dinh, mo khoa muc "metrics" duoi day. Bo qua neu khong can.
+# --------------------------------------------------------------------------
+# metrics:
+#   - name: sophos_sys_ses_count
+#     help: "So luong session hien tai"
+#     type: raw_number                 # ca dong output la 1 con so
+#     command: "system diagnostics utilities connections count"
+#
+#   - name: sophos_sys_ses_rate1
+#     help: "Chenh lech session count so voi lan poll truoc"
+#     type: delta                      # = gia tri hien tai - gia tri lan poll truoc
+#     source_metric: sophos_sys_ses_count
+#
+#   - name: sophos_sys_version_av
+#     help: "Phien ban Sophos AV signature"
+#     type: field_string               # lay chuoi sau dau ':' cua dong co nhan tren
+#     command: "system diagnostics show version-info"
+#     label: "Sophos AV"
+#
+#   - name: sophos_sys_version_ips
+#     help: "Phien ban IPS/Application signatures"
+#     type: field_string
+#     command: "system diagnostics show version-info"
+#     label: "IPS and Application signatures"
+#
+#   - name: sophos_vi_du_field_number
+#     help: "Vi du lay 1 so nam sau nhan (khong phai ca dong)"
+#     type: field_number               # lay so ngay sau dau ':' cua dong co nhan tren
+#     command: "ten lenh cli"
+#     label: "Ten nhan chinh xac truoc dau hai cham"

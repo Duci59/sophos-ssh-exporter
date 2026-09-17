@@ -1,0 +1,9 @@
+# Them vao prometheus.yml
+# Khac voi exporter kieu blackbox: o day KHONG dung ?target=, vi metric
+# da duoc poller nen thu san cho tat ca targets khai trong config.yml,
+# va duoc phan biet bang label "instance" ngay trong tung metric.
+
+scrape_configs:
+  - job_name: "sophos_ssh_exporter"
+    static_configs:
+      - targets: ["sophos-ssh-exporter:9200"]   # host:port noi chay app.py
