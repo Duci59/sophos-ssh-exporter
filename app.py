@@ -1,22 +1,6 @@
 """
-sophos_ssh_exporter (v4) - Prometheus exporter lay metric bang cach SSH vao
-Sophos Firewall CLI.
-
-Luong chuan (da kiem chung tren SFOS 21.5 / XGS4500):
-    ssh -> "Password:" -> nhap password
-        -> banner + "Select Menu Number [0-7]:" -> gui "4"
-        -> banner lai + prompt "console>"          <-- PHAI NUOT CAI NAY
-        -> gui lenh -> doc output den prompt "console>" ke tiep
-
-Thay doi so voi v3:
-  1. Sau khi vao Device Console, expect prompt "console>" dau tien de dong bo
-     buffer. Thieu buoc nay -> output cua lenh N bi gan cho lenh N+1.
-  2. Nuot dong echo cua lenh truoc khi doc output.
-  3. Loc ma mau ANSI / ky tu \r truoc khi regex.
-
-Chay thu:
-    pip install -r requirements.txt
-    python app.py --config config.yml --port 9200
+sophos_ssh_exporter (v5) - Prometheus exporter lay metric bang cach SSH vao
+Sophos Firewall CLI. Tich hop them kha nang lay thong tin SFP quang tu Advanced Shell.
 """
 
 import argparse
@@ -54,30 +38,35 @@ DEFAULT_CONSOLE_PROMPT = r"console>\s*"
 DEFAULT_METRICS: List[Dict[str, Any]] = [
     {
         "name": "sophos_sys_ses_count",
-        "help": "So luong session hien tai (tuong duong fgSysSesCount cua FortiGate)",
+        "help": "So luong session hien tai",
         "type": "raw_number",
         "command": "system diagnostics utilities connections count",
     },
     {
         "name": "sophos_sys_ses_rate1",
-        "help": "Chenh lech session count so voi lan poll truoc (tuong duong fgSysSesRate1)",
+        "help": "Chenh lech session count so voi lan poll truoc",
         "type": "delta",
         "source_metric": "sophos_sys_ses_count",
     },
     {
         "name": "sophos_sys_version_av",
-        "help": "Phien ban Sophos AV signature, dang info metric (tuong duong fgSysVersionAv)",
+        "help": "Phien ban Sophos AV signature",
         "type": "field_string",
         "command": "system diagnostics show version-info",
         "label": "Sophos AV",
     },
     {
         "name": "sophos_sys_version_ips",
-        "help": "Phien ban IPS/Application signatures, dang info metric (tuong duong fgSysVersionIps)",
+        "help": "Phien ban IPS/Application signatures",
         "type": "field_string",
         "command": "system diagnostics show version-info",
         "label": "IPS and Application signatures",
     },
+    {
+        "name": "sfp_inventory",
+        "help": "Lay thong tin SFP quang tu Advanced Shell (ethtool -m)",
+        "type": "sfp_inventory",
+    }
 ]
 
 # --------------------------------------------------------------------------
@@ -90,9 +79,11 @@ _info_gauges: Dict[str, Gauge] = {}
 _last_values_lock = threading.Lock()
 _last_values: Dict[Tuple[str, str], float] = {}
 
-# Nho lai chuoi version cua lan truoc de xoa series cu khi version doi
 _last_info_lock = threading.Lock()
 _last_info: Dict[Tuple[str, str], str] = {}
+
+_last_sfp_info_lock = threading.Lock()
+_last_sfp_info: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
 
 
 def get_numeric_gauge(name: str, help_text: str) -> Gauge:
@@ -103,30 +94,38 @@ def get_numeric_gauge(name: str, help_text: str) -> Gauge:
 
 
 def get_info_gauge(name: str, help_text: str) -> Gauge:
-    """Metric dang 'info': gia tri luon la 1, chuoi thuc su nam trong label 'version'."""
     with _gauge_lock:
         if name not in _info_gauges:
             _info_gauges[name] = Gauge(name, help_text or name, ["instance", "version"], registry=REGISTRY)
         return _info_gauges[name]
 
+# --------------------------------------------------------------------------
+# Gauge rieng cho SFP Inventory ghep lai theo rule
+# --------------------------------------------------------------------------
+SFP_COMMON_LABELS = ["device_name", "device_type", "entPhysicalIndex", "instance", "job", "vendor"]
+
+def get_sfp_gauge(metric_name: str, value_label: str) -> Gauge:
+    with _gauge_lock:
+        if metric_name not in _info_gauges:
+            _info_gauges[metric_name] = Gauge(
+                metric_name,
+                f"SFP {metric_name} info",
+                SFP_COMMON_LABELS + [value_label],
+                registry=REGISTRY
+            )
+        return _info_gauges[metric_name]
+
 
 # --------------------------------------------------------------------------
-# Lam sach output CLI
+# Lam sach output CLI & Trich xuat gia tri
 # --------------------------------------------------------------------------
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\r")
 
-
 def strip_ansi(text: str) -> str:
-    """Bo ma mau ANSI va \\r. Sophos to mau mot so dong (vd POP/IMAP proxy)."""
     return _ANSI_RE.sub("", text)
 
 
-# --------------------------------------------------------------------------
-# Trich xuat gia tri
-# --------------------------------------------------------------------------
-
 def extract_raw_number(command: str, output: str) -> Optional[float]:
-    """Lay dong dau tien chi chua 1 con so (bo qua dong echo lenh va prompt)."""
     cmd = command.strip()
     for line in output.splitlines():
         line = line.strip()
@@ -138,13 +137,6 @@ def extract_raw_number(command: str, output: str) -> Optional[float]:
 
 
 def extract_field_string(label: str, output: str) -> Optional[str]:
-    """Lay chuoi sau dau ':' cua dong bat dau bang dung nhan.
-
-    Vi du dong that tren SFOS 21.5:
-        "Sophos AV:                      1.0.21547"
-        "IPS and Application signatures: 18.25.58"
-    Neo ^ o dau dong de "Sophos AV" khong khop nham "Avira AV".
-    """
     pattern = re.compile(
         rf"^[ \t]*{re.escape(label)}[ \t]*:[ \t]*(\S.*?)[ \t]*$",
         re.MULTILINE,
@@ -182,12 +174,8 @@ def run_navigation(child: "pexpect.spawn", steps: list, ctx: Dict[str, Any]) -> 
             child.sendline(step["send"].format(**ctx))
 
 
-def send_and_capture(child: "pexpect.spawn", command: str, console_prompt: str,
-                     timeout: int) -> str:
-    """Gui 1 lenh, nuot dong echo, tra ve output da lam sach."""
+def send_and_capture(child: "pexpect.spawn", command: str, console_prompt: str, timeout: int) -> str:
     child.sendline(command)
-
-    # Nuot dong echo cua chinh lenh vua gui (neu co) de no khong lot vao output
     try:
         child.expect_exact(command, timeout=5)
     except (pexpect.TIMEOUT, pexpect.EOF):
@@ -212,24 +200,15 @@ def collect_once(target_name: str, target_cfg: Dict[str, Any], metric_defs: List
 
     child = pexpect.spawn(ssh_cmd, timeout=target_cfg.get("connect_timeout", 20), encoding="utf-8")
     success_gauge = get_numeric_gauge("sophos_ssh_scrape_success", "1 neu lan poll gan nhat thanh cong")
-    last_ts_gauge = get_numeric_gauge("sophos_ssh_last_scrape_timestamp_seconds",
-                                      "Unix timestamp cua lan poll gan nhat")
+    last_ts_gauge = get_numeric_gauge("sophos_ssh_last_scrape_timestamp_seconds", "Unix timestamp cua lan poll gan nhat")
+
+    has_sfp = any(m.get("type") == "sfp_inventory" for m in metric_defs)
 
     try:
         run_navigation(child, navigation, target_cfg)
-
-        # ------------------------------------------------------------------
-        # QUAN TRONG: sau khi chon "4", Sophos in lai banner
-        # (Firmware Version / Model / Hostname) roi moi ra prompt "console>".
-        # Phai doc het cho den prompt dau tien nay, neu khong lan expect
-        # ke tiep se khop nham prompt cu -> output bi lech mot nhip
-        # (metric A nhan output cua banner, metric B nhan output cua lenh A).
-        # ------------------------------------------------------------------
         child.expect(console_prompt, timeout=cmd_timeout)
-        log.debug("[%s] Da vao Device Console", target_name)
-
-        # Gom metric theo lenh: moi lenh chi chay 1 lan, ap dung nhieu
-        # phep trich xuat len cung 1 output.
+        
+        # --- 1. THU THAP METRIC TREN DEVICE CONSOLE ---
         commands_needed: Dict[str, List[Dict[str, Any]]] = {}
         for m in metric_defs:
             if m["type"] in ("raw_number", "field_string", "field_number"):
@@ -239,7 +218,6 @@ def collect_once(target_name: str, target_cfg: Dict[str, Any], metric_defs: List
 
         for command, defs in commands_needed.items():
             output = send_and_capture(child, command, console_prompt, cmd_timeout)
-
             for m in defs:
                 mtype = m["type"]
                 if mtype == "raw_number":
@@ -252,55 +230,99 @@ def collect_once(target_name: str, target_cfg: Dict[str, Any], metric_defs: List
                     value = None
 
                 if value is None:
-                    log.warning("[%s] khong trich xuat duoc metric '%s' tu lenh '%s'. Output:\n%s",
-                                target_name, m["name"], command, output)
                     continue
 
                 values_this_poll[m["name"]] = value
-
                 if mtype == "field_string":
                     gauge = get_info_gauge(m["name"], m.get("help", ""))
                     key = (target_name, m["name"])
                     with _last_info_lock:
                         old = _last_info.get(key)
                         _last_info[key] = value
-                    # Version doi -> xoa series cu, tranh ton tai 2 series cung luc
                     if old is not None and old != value:
                         try:
                             gauge.remove(target_name, old)
                         except KeyError:
                             pass
                     gauge.labels(target_name, value).set(1)
-                    log.info("[%s] %s{version=%r} = 1", target_name, m["name"], value)
                 else:
                     gauge = get_numeric_gauge(m["name"], m.get("help", ""))
                     gauge.labels(target_name).set(value)
-                    log.info("[%s] %s = %s", target_name, m["name"], value)
 
-        # Metric dang "delta"
+        # Xy ly metric delta
         for m in metric_defs:
-            if m["type"] != "delta":
-                continue
-            src_name = m["source_metric"]
-            current = values_this_poll.get(src_name)
-            if current is None:
-                continue
+            if m["type"] == "delta":
+                src_name = m["source_metric"]
+                current = values_this_poll.get(src_name)
+                if current is None: continue
+                key = (target_name, src_name)
+                with _last_values_lock:
+                    previous = _last_values.get(key)
+                    _last_values[key] = current
+                if previous is not None:
+                    delta = current - previous
+                    gauge = get_numeric_gauge(m["name"], m.get("help", ""))
+                    gauge.labels(target_name).set(delta)
 
-            key = (target_name, src_name)
-            with _last_values_lock:
-                previous = _last_values.get(key)
-                _last_values[key] = current
-
-            if previous is not None:
-                delta = current - previous
-                gauge = get_numeric_gauge(m["name"], m.get("help", ""))
-                gauge.labels(target_name).set(delta)
-                log.info("[%s] %s = %s (delta)", target_name, m["name"], delta)
-
-        # Thoat gon gang: exit ve Main Menu roi chon 0
+        # Thoat khoi Device Console de ve Main Menu
         try:
             child.sendline("exit")
             child.expect("Select Menu Number", timeout=5)
+        except (pexpect.TIMEOUT, pexpect.EOF):
+            pass
+
+        # --- 2. THU THAP SFP TREN ADVANCED SHELL ---
+        if has_sfp:
+            try:
+                child.sendline("5")
+                child.expect("Select Menu Number", timeout=5)
+                child.sendline("3")
+                child.expect(r"#\s*", timeout=5)
+                
+                sfp_ports = [f"PortA{i}" for i in range(1, 9)] + [f"PortF{i}" for i in range(1, 5)] + [f"PortB{i}" for i in range(1, 5)]
+                for i, port in enumerate(sfp_ports, start=1):
+                    idx = str(i)
+                    cmd = f"ethtool -m {port}"
+                    child.sendline(cmd)
+                    
+                    try:
+                        child.expect_exact(cmd, timeout=2)
+                    except (pexpect.TIMEOUT, pexpect.EOF):
+                        pass
+                    
+                    child.expect(r"#\s*", timeout=10)
+                    out = strip_ansi(child.before or "")
+                    
+                    mfg = extract_field_string("Vendor name", out)
+                    pn = extract_field_string("Vendor PN", out)
+                    
+                    if mfg and pn:
+                        key = (target_name, idx)
+                        with _last_sfp_info_lock:
+                            old_data = _last_sfp_info.get(key)
+                            if old_data:
+                                old_mfg, old_pn, old_port = old_data
+                                if old_mfg != mfg or old_pn != pn or old_port != port:
+                                    try:
+                                        get_sfp_gauge("entPhysicalMfgName", "entPhysicalMfgName").remove(target_name, "firewall", idx, host, "firewall", "sophos", old_mfg)
+                                        get_sfp_gauge("entPhysicalModelName", "entPhysicalModelName").remove(target_name, "firewall", idx, host, "firewall", "sophos", old_pn)
+                                        get_sfp_gauge("entPhysicalName", "entPhysicalName").remove(target_name, "firewall", idx, host, "firewall", "sophos", old_port)
+                                    except KeyError:
+                                        pass
+                            _last_sfp_info[key] = (mfg, pn, port)
+                            
+                        get_sfp_gauge("entPhysicalMfgName", "entPhysicalMfgName").labels(target_name, "firewall", idx, host, "firewall", "sophos", mfg).set(1)
+                        get_sfp_gauge("entPhysicalModelName", "entPhysicalModelName").labels(target_name, "firewall", idx, host, "firewall", "sophos", pn).set(1)
+                        get_sfp_gauge("entPhysicalName", "entPhysicalName").labels(target_name, "firewall", idx, host, "firewall", "sophos", port).set(1)
+                
+                # Thoat Advanced Shell ve Main Menu
+                child.sendline("exit")
+                child.expect("Select Menu Number", timeout=5)
+            except Exception as e:
+                log.warning("[%s] Loi khi lay SFP info: %s", target_name, e)
+
+        # Ket thuc Session SSH
+        try:
             child.sendline("0")
         except (pexpect.TIMEOUT, pexpect.EOF):
             pass
@@ -321,7 +343,7 @@ def poller_loop(target_name: str, target_cfg: Dict[str, Any], metric_defs: List[
     while True:
         try:
             collect_once(target_name, target_cfg, metric_defs)
-        except Exception as exc:  # noqa: BLE001 - khong de thread chet
+        except Exception as exc:  # noqa: BLE001
             log.error("[%s] Loi khong mong doi trong poller_loop: %s", target_name, exc)
         time.sleep(interval)
 
@@ -334,10 +356,9 @@ def poller_loop(target_name: str, target_cfg: Dict[str, Any], metric_defs: List[
 def metrics():
     return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
 
-
 @app.route("/")
 def index():
-    return '<h3>sophos_ssh_exporter</h3><p><a href="/metrics">/metrics</a></p>'
+    return '<h3>sophos_ssh_exporter v5</h3><p><a href="/metrics">/metrics</a></p>'
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -369,7 +390,6 @@ def main():
                  target["name"], target.get("poll_interval", 30), len(metric_defs))
 
     app.run(host=args.host, port=args.port)
-
 
 if __name__ == "__main__":
     main()
