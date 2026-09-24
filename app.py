@@ -1,6 +1,5 @@
 """
-sophos_ssh_exporter (v5) - Prometheus exporter lay metric bang cach SSH vao
-Sophos Firewall CLI. Tich hop them kha nang lay thong tin SFP quang tu Advanced Shell.
+sophos_ssh_exporter (v7 - On-Demand & Hardcoded Metrics - SFP Bug Fixed)
 """
 
 import argparse
@@ -8,34 +7,28 @@ import logging
 import re
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import pexpect
 import yaml
-from flask import Flask, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Gauge, generate_latest, REGISTRY
+from flask import Flask, Response, request
+from prometheus_client import CONTENT_TYPE_LATEST, Gauge, CollectorRegistry, generate_latest
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("sophos_ssh_exporter")
 
 app = Flask(__name__)
+CONFIG_DATA = {}
 
-# --------------------------------------------------------------------------
-# Luong dang nhap + dieu huong menu mac dinh (hard-code)
-# --------------------------------------------------------------------------
 DEFAULT_NAVIGATION = [
     {"expect": r"[Pp]assword:", "send": "{password}"},
     {"expect": r"Select Menu Number", "send": "4"},
 ]
 DEFAULT_CONSOLE_PROMPT = r"console>\s*"
+SFP_COMMON_LABELS = ["device_name", "device_type", "entPhysicalIndex", "instance", "job", "vendor"]
 
-# --------------------------------------------------------------------------
-# Bo metric mac dinh
-# --------------------------------------------------------------------------
-DEFAULT_METRICS: List[Dict[str, Any]] = [
+# --- DANH SACH METRIC DUOC FIX CUNG TRONG CODE ---
+BUILTIN_METRICS = [
     {
         "name": "sophos_sys_ses_count",
         "help": "So luong session hien tai",
@@ -64,66 +57,19 @@ DEFAULT_METRICS: List[Dict[str, Any]] = [
     },
     {
         "name": "sfp_inventory",
-        "help": "Lay thong tin SFP quang tu Advanced Shell (ethtool -m)",
+        "help": "Lay thong tin SFP quang tu Advanced Shell",
         "type": "sfp_inventory",
     }
 ]
 
-# --------------------------------------------------------------------------
-# Gauge registry
-# --------------------------------------------------------------------------
-_gauge_lock = threading.Lock()
-_numeric_gauges: Dict[str, Gauge] = {}
-_info_gauges: Dict[str, Gauge] = {}
+# State de luu tru gia tri truoc do cho cac metric dang "delta"
+_state_lock = threading.Lock()
+_target_state: Dict[str, Dict[str, float]] = {}
 
-_last_values_lock = threading.Lock()
-_last_values: Dict[Tuple[str, str], float] = {}
-
-_last_info_lock = threading.Lock()
-_last_info: Dict[Tuple[str, str], str] = {}
-
-_last_sfp_info_lock = threading.Lock()
-_last_sfp_info: Dict[Tuple[str, str], Tuple[str, str, str]] = {}
-
-
-def get_numeric_gauge(name: str, help_text: str) -> Gauge:
-    with _gauge_lock:
-        if name not in _numeric_gauges:
-            _numeric_gauges[name] = Gauge(name, help_text or name, ["instance"], registry=REGISTRY)
-        return _numeric_gauges[name]
-
-
-def get_info_gauge(name: str, help_text: str) -> Gauge:
-    with _gauge_lock:
-        if name not in _info_gauges:
-            _info_gauges[name] = Gauge(name, help_text or name, ["instance", "version"], registry=REGISTRY)
-        return _info_gauges[name]
-
-# --------------------------------------------------------------------------
-# Gauge rieng cho SFP Inventory ghep lai theo rule
-# --------------------------------------------------------------------------
-SFP_COMMON_LABELS = ["device_name", "device_type", "entPhysicalIndex", "instance", "job", "vendor"]
-
-def get_sfp_gauge(metric_name: str, value_label: str) -> Gauge:
-    with _gauge_lock:
-        if metric_name not in _info_gauges:
-            _info_gauges[metric_name] = Gauge(
-                metric_name,
-                f"SFP {metric_name} info",
-                SFP_COMMON_LABELS + [value_label],
-                registry=REGISTRY
-            )
-        return _info_gauges[metric_name]
-
-
-# --------------------------------------------------------------------------
-# Lam sach output CLI & Trich xuat gia tri
-# --------------------------------------------------------------------------
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\r")
 
 def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
-
 
 def extract_raw_number(command: str, output: str) -> Optional[float]:
     cmd = command.strip()
@@ -135,143 +81,103 @@ def extract_raw_number(command: str, output: str) -> Optional[float]:
             return float(line)
     return None
 
-
 def extract_field_string(label: str, output: str) -> Optional[str]:
-    pattern = re.compile(
-        rf"^[ \t]*{re.escape(label)}[ \t]*:[ \t]*(\S.*?)[ \t]*$",
-        re.MULTILINE,
-    )
+    pattern = re.compile(rf"^[ \t]*{re.escape(label)}[ \t]*:[ \t]*(\S.*?)[ \t]*$", re.MULTILINE)
     m = pattern.search(output)
     return m.group(1).strip() if m else None
 
-
 def extract_field_number(label: str, output: str) -> Optional[float]:
-    pattern = re.compile(
-        rf"^[ \t]*{re.escape(label)}[ \t]*:[ \t]*([-+]?\d+(?:\.\d+)?)",
-        re.MULTILINE,
-    )
+    pattern = re.compile(rf"^[ \t]*{re.escape(label)}[ \t]*:[ \t]*([-+]?\d+(?:\.\d+)?)", re.MULTILINE)
     m = pattern.search(output)
     return float(m.group(1)) if m else None
-
-
-# --------------------------------------------------------------------------
-# SSH / CLI automation
-# --------------------------------------------------------------------------
 
 def run_navigation(child: "pexpect.spawn", steps: list, ctx: Dict[str, Any]) -> None:
     for step in steps:
         pattern = step["expect"]
-        optional = step.get("optional", False)
-
-        if optional:
+        if step.get("optional", False):
             idx = child.expect([pattern, pexpect.TIMEOUT], timeout=step.get("timeout", 5))
-            if idx != 0:
-                continue
+            if idx != 0: continue
         else:
             child.expect(pattern, timeout=step.get("timeout", 20))
-
         if "send" in step:
             child.sendline(step["send"].format(**ctx))
-
 
 def send_and_capture(child: "pexpect.spawn", command: str, console_prompt: str, timeout: int) -> str:
     child.sendline(command)
     try:
         child.expect_exact(command, timeout=5)
-    except (pexpect.TIMEOUT, pexpect.EOF):
-        pass
-
+    except: pass
     child.expect(console_prompt, timeout=timeout)
     return strip_ansi(child.before or "")
 
+def collect_from_target(target_ip: str, module_cfg: Dict[str, Any], registry: CollectorRegistry) -> None:
+    port = module_cfg.get("port", 22)
+    username = module_cfg["username"]
+    ssh_cmd = f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p {port} {username}@{target_ip}"
+    
+    cmd_timeout = module_cfg.get("command_timeout", 20)
+    console_prompt = module_cfg.get("console_prompt", DEFAULT_CONSOLE_PROMPT)
+    has_sfp = any(m.get("type") == "sfp_inventory" for m in BUILTIN_METRICS)
 
-def collect_once(target_name: str, target_cfg: Dict[str, Any], metric_defs: List[Dict[str, Any]]) -> None:
-    host = target_cfg["host"]
-    port = target_cfg.get("port", 22)
-    username = target_cfg["username"]
-    ssh_cmd = (
-        f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-        f"-p {port} {username}@{host}"
-    )
-
-    navigation = target_cfg.get("menu_navigation", DEFAULT_NAVIGATION)
-    console_prompt = target_cfg.get("console_prompt", DEFAULT_CONSOLE_PROMPT)
-    cmd_timeout = target_cfg.get("command_timeout", 20)
-
-    child = pexpect.spawn(ssh_cmd, timeout=target_cfg.get("connect_timeout", 20), encoding="utf-8")
-    success_gauge = get_numeric_gauge("sophos_ssh_scrape_success", "1 neu lan poll gan nhat thanh cong")
-    last_ts_gauge = get_numeric_gauge("sophos_ssh_last_scrape_timestamp_seconds", "Unix timestamp cua lan poll gan nhat")
-
-    has_sfp = any(m.get("type") == "sfp_inventory" for m in metric_defs)
-
+    success_gauge = Gauge("sophos_ssh_scrape_success", "Scrape success", ["instance"], registry=registry)
+    duration_gauge = Gauge("sophos_ssh_scrape_duration_seconds", "Scrape duration", ["instance"], registry=registry)
+    
+    start_time = time.time()
+    child = pexpect.spawn(ssh_cmd, timeout=module_cfg.get("connect_timeout", 20), encoding="utf-8")
+    
     try:
-        run_navigation(child, navigation, target_cfg)
+        run_navigation(child, module_cfg.get("menu_navigation", DEFAULT_NAVIGATION), module_cfg)
         child.expect(console_prompt, timeout=cmd_timeout)
         
-        # --- 1. THU THAP METRIC TREN DEVICE CONSOLE ---
-        commands_needed: Dict[str, List[Dict[str, Any]]] = {}
-        for m in metric_defs:
+        commands_needed = {}
+        for m in BUILTIN_METRICS:
             if m["type"] in ("raw_number", "field_string", "field_number"):
                 commands_needed.setdefault(m["command"], []).append(m)
-
-        values_this_poll: Dict[str, Any] = {}
-
+        
+        values_this_poll = {}
+        
+        # --- 1. GET DEVICE CONSOLE METRICS ---
         for command, defs in commands_needed.items():
             output = send_and_capture(child, command, console_prompt, cmd_timeout)
             for m in defs:
                 mtype = m["type"]
-                if mtype == "raw_number":
-                    value = extract_raw_number(command, output)
-                elif mtype == "field_string":
-                    value = extract_field_string(m["label"], output)
-                elif mtype == "field_number":
-                    value = extract_field_number(m["label"], output)
-                else:
-                    value = None
-
-                if value is None:
-                    continue
-
+                if mtype == "raw_number": value = extract_raw_number(command, output)
+                elif mtype == "field_string": value = extract_field_string(m["label"], output)
+                elif mtype == "field_number": value = extract_field_number(m["label"], output)
+                else: value = None
+                
+                if value is None: continue
                 values_this_poll[m["name"]] = value
+                
                 if mtype == "field_string":
-                    gauge = get_info_gauge(m["name"], m.get("help", ""))
-                    key = (target_name, m["name"])
-                    with _last_info_lock:
-                        old = _last_info.get(key)
-                        _last_info[key] = value
-                    if old is not None and old != value:
-                        try:
-                            gauge.remove(target_name, old)
-                        except KeyError:
-                            pass
-                    gauge.labels(target_name, value).set(1)
+                    g = Gauge(m["name"], m.get("help", ""), ["instance", "version"], registry=registry)
+                    g.labels(instance=target_ip, version=value).set(1)
                 else:
-                    gauge = get_numeric_gauge(m["name"], m.get("help", ""))
-                    gauge.labels(target_name).set(value)
+                    g = Gauge(m["name"], m.get("help", ""), ["instance"], registry=registry)
+                    g.labels(instance=target_ip).set(value)
+        
+        # Xu ly Metric dang Delta (tinh toan chenh lech)
+        with _state_lock:
+            if target_ip not in _target_state:
+                _target_state[target_ip] = {}
+            for m in BUILTIN_METRICS:
+                if m["type"] == "delta":
+                    src_name = m["source_metric"]
+                    current = values_this_poll.get(src_name)
+                    if current is None: continue
+                    previous = _target_state[target_ip].get(src_name)
+                    _target_state[target_ip][src_name] = current
+                    if previous is not None:
+                        delta = current - previous
+                        g = Gauge(m["name"], m.get("help", ""), ["instance"], registry=registry)
+                        g.labels(instance=target_ip).set(delta)
 
-        # Xy ly metric delta
-        for m in metric_defs:
-            if m["type"] == "delta":
-                src_name = m["source_metric"]
-                current = values_this_poll.get(src_name)
-                if current is None: continue
-                key = (target_name, src_name)
-                with _last_values_lock:
-                    previous = _last_values.get(key)
-                    _last_values[key] = current
-                if previous is not None:
-                    delta = current - previous
-                    gauge = get_numeric_gauge(m["name"], m.get("help", ""))
-                    gauge.labels(target_name).set(delta)
-
-        # Thoat khoi Device Console de ve Main Menu
         try:
             child.sendline("exit")
             child.expect("Select Menu Number", timeout=5)
-        except (pexpect.TIMEOUT, pexpect.EOF):
-            pass
+        except: pass
 
-        # --- 2. THU THAP SFP TREN ADVANCED SHELL ---
+        # --- 2. GET ADVANCED SHELL SFP METRICS ---
         if has_sfp:
             try:
                 child.sendline("5")
@@ -279,16 +185,18 @@ def collect_once(target_name: str, target_cfg: Dict[str, Any], metric_defs: List
                 child.sendline("3")
                 child.expect(r"#\s*", timeout=5)
                 
+                # Khoi tao metric chi 1 lan duy nhat cho moi request tranh loi duplicate registry
+                g_mfg = Gauge("entPhysicalMfgName", "SFP Mfg", SFP_COMMON_LABELS + ["entPhysicalMfgName"], registry=registry)
+                g_mdl = Gauge("entPhysicalModelName", "SFP Model", SFP_COMMON_LABELS + ["entPhysicalModelName"], registry=registry)
+                g_name = Gauge("entPhysicalName", "SFP Name", SFP_COMMON_LABELS + ["entPhysicalName"], registry=registry)
+
                 sfp_ports = [f"PortA{i}" for i in range(1, 9)] + [f"PortF{i}" for i in range(1, 5)] + [f"PortB{i}" for i in range(1, 5)]
                 for i, port in enumerate(sfp_ports, start=1):
                     idx = str(i)
                     cmd = f"ethtool -m {port}"
                     child.sendline(cmd)
-                    
-                    try:
-                        child.expect_exact(cmd, timeout=2)
-                    except (pexpect.TIMEOUT, pexpect.EOF):
-                        pass
+                    try: child.expect_exact(cmd, timeout=2)
+                    except: pass
                     
                     child.expect(r"#\s*", timeout=10)
                     out = strip_ansi(child.before or "")
@@ -297,99 +205,51 @@ def collect_once(target_name: str, target_cfg: Dict[str, Any], metric_defs: List
                     pn = extract_field_string("Vendor PN", out)
                     
                     if mfg and pn:
-                        key = (target_name, idx)
-                        with _last_sfp_info_lock:
-                            old_data = _last_sfp_info.get(key)
-                            if old_data:
-                                old_mfg, old_pn, old_port = old_data
-                                if old_mfg != mfg or old_pn != pn or old_port != port:
-                                    try:
-                                        get_sfp_gauge("entPhysicalMfgName", "entPhysicalMfgName").remove(target_name, "firewall", idx, host, "firewall", "sophos", old_mfg)
-                                        get_sfp_gauge("entPhysicalModelName", "entPhysicalModelName").remove(target_name, "firewall", idx, host, "firewall", "sophos", old_pn)
-                                        get_sfp_gauge("entPhysicalName", "entPhysicalName").remove(target_name, "firewall", idx, host, "firewall", "sophos", old_port)
-                                    except KeyError:
-                                        pass
-                            _last_sfp_info[key] = (mfg, pn, port)
-                            
-                        get_sfp_gauge("entPhysicalMfgName", "entPhysicalMfgName").labels(target_name, "firewall", idx, host, "firewall", "sophos", mfg).set(1)
-                        get_sfp_gauge("entPhysicalModelName", "entPhysicalModelName").labels(target_name, "firewall", idx, host, "firewall", "sophos", pn).set(1)
-                        get_sfp_gauge("entPhysicalName", "entPhysicalName").labels(target_name, "firewall", idx, host, "firewall", "sophos", port).set(1)
+                        g_mfg.labels(device_name=target_ip, device_type="firewall", entPhysicalIndex=idx, instance=target_ip, job="firewall", vendor="sophos", entPhysicalMfgName=mfg).set(1)
+                        g_mdl.labels(device_name=target_ip, device_type="firewall", entPhysicalIndex=idx, instance=target_ip, job="firewall", vendor="sophos", entPhysicalModelName=pn).set(1)
+                        g_name.labels(device_name=target_ip, device_type="firewall", entPhysicalIndex=idx, instance=target_ip, job="firewall", vendor="sophos", entPhysicalName=port).set(1)
                 
-                # Thoat Advanced Shell ve Main Menu
                 child.sendline("exit")
                 child.expect("Select Menu Number", timeout=5)
             except Exception as e:
-                log.warning("[%s] Loi khi lay SFP info: %s", target_name, e)
+                log.warning("[%s] Loi SFP: %s", target_ip, e)
 
-        # Ket thuc Session SSH
-        try:
-            child.sendline("0")
-        except (pexpect.TIMEOUT, pexpect.EOF):
-            pass
+        try: child.sendline("0")
+        except: pass
 
-        success_gauge.labels(target_name).set(1)
+        success_gauge.labels(instance=target_ip).set(1)
 
-    except Exception as exc:  # noqa: BLE001
-        log.error("[%s] Loi khi poll qua SSH: %s", target_name, exc)
-        success_gauge.labels(target_name).set(0)
-
+    except Exception as exc:
+        log.error("[%s] Loi SSH: %s", target_ip, exc)
+        success_gauge.labels(instance=target_ip).set(0)
     finally:
-        last_ts_gauge.labels(target_name).set(time.time())
+        duration_gauge.labels(instance=target_ip).set(time.time() - start_time)
         child.close(force=True)
 
-
-def poller_loop(target_name: str, target_cfg: Dict[str, Any], metric_defs: List[Dict[str, Any]]) -> None:
-    interval = target_cfg.get("poll_interval", 30)
-    while True:
-        try:
-            collect_once(target_name, target_cfg, metric_defs)
-        except Exception as exc:  # noqa: BLE001
-            log.error("[%s] Loi khong mong doi trong poller_loop: %s", target_name, exc)
-        time.sleep(interval)
-
-
-# --------------------------------------------------------------------------
-# HTTP server
-# --------------------------------------------------------------------------
-
-@app.route("/metrics")
-def metrics():
-    return Response(generate_latest(REGISTRY), mimetype=CONTENT_TYPE_LATEST)
+@app.route("/scrape")
+def scrape():
+    target = request.args.get("target")
+    module_name = request.args.get("module", "default")
+    if not target:
+        return "Missing 'target' parameter", 400
+    if module_name not in CONFIG_DATA.get("modules", {}):
+        return f"Module '{module_name}' not found", 404
+        
+    registry = CollectorRegistry()
+    collect_from_target(target, CONFIG_DATA["modules"][module_name], registry)
+    return Response(generate_latest(registry), mimetype=CONTENT_TYPE_LATEST)
 
 @app.route("/")
 def index():
-    return '<h3>sophos_ssh_exporter v5</h3><p><a href="/metrics">/metrics</a></p>'
-
-
-def load_config(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Sophos Firewall SSH-CLI Prometheus exporter")
-    parser.add_argument("--config", default="config.yml")
-    parser.add_argument("--port", type=int, default=9200)
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--debug", action="store_true", help="Bat log DEBUG")
-    args = parser.parse_args()
-
-    if args.debug:
-        log.setLevel(logging.DEBUG)
-
-    cfg = load_config(args.config)
-    global_metrics = cfg.get("metrics") or DEFAULT_METRICS
-
-    for target in cfg.get("targets", []):
-        metric_defs = target.get("metrics", global_metrics)
-        t = threading.Thread(
-            target=poller_loop, args=(target["name"], target, metric_defs), daemon=True
-        )
-        t.start()
-        log.info("Da khoi dong poller cho target '%s' (moi %ss, %d metric)",
-                 target["name"], target.get("poll_interval", 30), len(metric_defs))
-
-    app.run(host=args.host, port=args.port)
+    return '<h3>sophos_ssh_exporter v7</h3><p><a href="/scrape?target=1.2.3.4">/scrape?target=1.2.3.4</a></p>'
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.yml")
+    parser.add_argument("--port", type=int, default=9200)
+    args = parser.parse_args()
+    
+    with open(args.config, "r", encoding="utf-8") as f:
+        CONFIG_DATA = yaml.safe_load(f)
+        
+    app.run(host="0.0.0.0", port=args.port, threaded=True)
